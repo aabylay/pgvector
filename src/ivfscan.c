@@ -2,6 +2,7 @@
 
 #include <float.h>
 
+#include "access/amapi.h"
 #include "access/genam.h"
 #include "access/itup.h"
 #include "access/relscan.h"
@@ -155,6 +156,15 @@ GetScanItems(IndexScanDesc scan, Datum value)
 				ItemId		itemid = PageGetItemId(page, offno);
 
 				itup = (IndexTuple) PageGetItem(page, itemid);
+
+				/*
+				 * Skip tuples that cannot pass the query's filter before
+				 * computing their distance (see ivfprefilter.c)
+				 */
+				if (so->prefilter != NULL &&
+					!IvfflatPrefilterContains(so->prefilter, &itup->t_tid))
+					continue;
+
 				datum = index_getattr(itup, 1, tupdesc, &isnull);
 
 				/*
@@ -287,6 +297,12 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->dimensions = dimensions;
 	so->value = PointerGetDatum(NULL);
 
+	/*
+	 * Owned and managed exclusively by the IvfPrefilterScan custom node;
+	 * nothing else in the AM (including ivfflatrescan) writes it
+	 */
+	so->prefilter = NULL;
+
 	/* Set support functions */
 	so->procinfo = index_getprocinfo(index, 1, IVFFLAT_DISTANCE_PROC);
 	so->normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_NORM_PROC);
@@ -414,6 +430,26 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
 	return true;
+}
+
+/*
+ * Install (or clear) a prefilter TID set for a scan
+ *
+ * Used only by the IvfPrefilterScan custom node; a failure here would be a
+ * pgvector bug, not a user error
+ */
+void
+IvfflatScanSetPrefilter(IndexScanDesc scan, IvfflatPrefilter * pf)
+{
+	IvfflatScanOpaque so;
+
+	if (scan == NULL || scan->indexRelation == NULL ||
+		scan->indexRelation->rd_indam == NULL ||
+		scan->indexRelation->rd_indam->ambeginscan != ivfflatbeginscan)
+		elog(ERROR, "cannot set prefilter on non-ivfflat scan");
+
+	so = (IvfflatScanOpaque) scan->opaque;
+	so->prefilter = pf;
 }
 
 /*

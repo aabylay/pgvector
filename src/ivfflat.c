@@ -64,6 +64,14 @@ IvfflatInit(void)
 							NULL, &ivfflat_max_probes,
 							IVFFLAT_MAX_LISTS, IVFFLAT_MIN_LISTS, IVFFLAT_MAX_LISTS, PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("ivfflat.prefilter", "Enables B-tree pre-filtering for filtered scans",
+							 NULL, &ivfflat_prefilter,
+							 true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ivfflat.prefilter_mem", "Sets the memory budget for the prefilter TID set",
+							"-1 means use work_mem.", &ivfflat_prefilter_mem,
+							-1, -1, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("ivfflat");
 }
 

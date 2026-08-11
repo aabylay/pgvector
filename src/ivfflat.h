@@ -13,6 +13,7 @@
 #include "storage/condition_variable.h"
 #include "utils/sampling.h"
 #include "utils/tuplesort.h"
+#include "ivfprefilter.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -299,6 +300,9 @@ typedef struct IvfflatScanOpaqueData
 	BlockNumber *listPages;
 	int			listIndex;
 	IvfflatScanList *lists;
+
+	/* Pre-filter installed by the IvfPrefilterScan custom node (may be NULL) */
+	IvfflatPrefilter *prefilter;
 }			IvfflatScanOpaqueData;
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;

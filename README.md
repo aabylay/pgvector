@@ -445,12 +445,44 @@ Exact indexes work well for conditions that match a low percentage of rows. Othe
 
 ```sql
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
+# or
+CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
 ```
 
 With approximate indexes, filtering is applied *after* the index is scanned. If a condition matches 10% of rows, with HNSW and the default `hnsw.ef_search` of 40, only 4 rows will match on average. For more rows, enable [iterative index scans](#iterative-index-scans), which will automatically scan more of the index when needed.
 
 ```sql
 SET hnsw.iterative_scan = strict_order;
+# or
+SET ivfflat.iterative_scan = relaxed_order;
+```
+
+#### IVFFlat Pre-filtering
+
+For IVFFlat, when a B-tree (or expression / partial B-tree) index already exists on the filter column, pgvector can evaluate the filter *before* distance computations. The planner builds an `IvfPrefilterScan` that drains matching heap TIDs from the B-tree into an in-memory set, and the IVFFlat scan skips non-matching candidates. The IVFFlat index plan keeps the original `Filter` for correctness.
+
+```sql
+CREATE INDEX ON items (category_id);
+CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
+
+SET ivfflat.iterative_scan = relaxed_order;
+SET ivfflat.max_probes = 100;
+
+EXPLAIN SELECT * FROM items WHERE category_id = 123 ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
+```
+
+Supported filter forms (v1): `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN` / `= ANY`, and `IS NULL`, including expression and partial B-tree indexes. The B-tree must already exist — pgvector does not create it. Pre-filtering does not change recall by itself; raise probes (or enable iterative scans) now that each probe is cheaper.
+
+Enable or disable pre-filtering (`on` by default)
+
+```sql
+SET ivfflat.prefilter = off;
+```
+
+Specify the memory budget for the prefilter TID set in kB (`-1` uses `work_mem` by default)
+
+```sql
+SET ivfflat.prefilter_mem = 256;
 ```
 
 If filtering by only a few distinct values, consider [partial indexing](https://www.postgresql.org/docs/current/indexes-partial.html).
