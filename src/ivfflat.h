@@ -43,8 +43,13 @@ typedef Pointer Item;
 #define IVFFLAT_NPROCS 5
 
 #define IVFFLAT_VERSION	1
+#define IVFFLAT_VERSION_INCLUDE 2
 #define IVFFLAT_MAGIC_NUMBER 0x14FF1A7
 #define IVFFLAT_PAGE_ID	0xFF84
+
+/* INCLUDE column chains (version-2 indexes). See docs/filtered-ivf.md */
+#define IVFFLAT_MAX_INCLUDE_COLS	(INDEX_MAX_KEYS - 1)
+#define IVFFLAT_MAX_INCLUDE_WIDTH	512
 
 /* Preserved page numbers */
 #define IVFFLAT_METAPAGE_BLKNO	0
@@ -65,6 +70,7 @@ typedef Pointer Item;
 #define IVFFLAT_LIST_SIZE(size)	add_size(offsetof(IvfflatListData, center), size)
 
 #define IvfflatPageGetOpaque(page)	((IvfflatPageOpaque) PageGetSpecialPointer(page))
+#define IvfflatPageGetOpaqueV2(page) ((IvfflatPageOpaqueDataV2 *) PageGetSpecialPointer(page))
 #define IvfflatPageGetMeta(page)	((IvfflatMetaPageData *) PageGetContents(page))
 
 #ifdef IVFFLAT_BENCH
@@ -195,6 +201,11 @@ typedef struct IvfflatBuildState
 	/* Settings */
 	int			dimensions;
 	int			lists;
+	int			includeCount;	/* 0 keeps a version-1 index */
+	int			version;
+	uint16		includeWidth[IVFFLAT_MAX_INCLUDE_COLS];
+	TupleDesc	vectorDesc;		/* one-attribute descriptor for the vector */
+	TupleDesc  *includeDescs;	/* one-attribute descriptors, version 2 */
 
 	/* Statistics */
 	double		indtuples;
@@ -265,12 +276,160 @@ typedef struct IvfflatListData
 
 typedef IvfflatListData * IvfflatList;
 
+typedef struct IvfflatMetaPageDataV2
+{
+	uint32		magicNumber;
+	uint32		version;		/* IVFFLAT_VERSION_INCLUDE */
+	uint16		dimensions;
+	uint16		lists;
+	uint16		includeCount;	/* 1 .. IVFFLAT_MAX_INCLUDE_COLS */
+	uint16		includeWidth[IVFFLAT_MAX_INCLUDE_COLS]; /* acceptance bound,
+														 * bytes. Slots at and
+														 * above includeCount
+														 * are zero. */
+}			IvfflatMetaPageDataV2;
+
+typedef struct IvfflatIncludeChain
+{
+	BlockNumber startPage;
+	BlockNumber insertPage;
+}			IvfflatIncludeChain;
+
+typedef struct IvfflatListDataV2
+{
+	BlockNumber startPage;		/* vector entry chain */
+	BlockNumber insertPage;
+	BlockNumber dirStartPage;	/* vector-page directory */
+	uint32		entry_hwm;		/* next entry_id to allocate; never decreases */
+	uint32		live_count;		/* live vector entries in this list */
+	/* IvfflatIncludeChain includeChains[includeCount] follows.
+	 * The center Vector follows those, at a MAXALIGN offset. */
+}			IvfflatListDataV2;
+
+typedef struct IvfflatPageOpaqueDataV2
+{
+	BlockNumber nextblkno;
+	uint32		min_entry_id;
+	uint32		max_entry_id;
+	uint16		live_items;
+	uint16		page_id;		/* IVFFLAT_PAGE_ID */
+}			IvfflatPageOpaqueDataV2;
+
+typedef struct IvfflatEntryHeader
+{
+	uint32		entry_id;
+	/* IndexTuple bytes follow immediately. There is no tuple member. */
+}			IvfflatEntryHeader;
+
+typedef struct IvfflatVectorDirEntry
+{
+	BlockNumber blkno;
+	uint32		min_entry_id;
+	uint32		max_entry_id;
+	uint16		live_items;
+	uint16		unused;
+}			IvfflatVectorDirEntry;
+
+typedef struct IvfflatMetaInfo
+{
+	uint32		version;
+	int			lists;
+	int			dimensions;
+	int			includeCount;
+	uint16		includeWidth[IVFFLAT_MAX_INCLUDE_COLS];
+}			IvfflatMetaInfo;
+
+/*
+ * Installed by IvfIncludeScan. The access method does not free the
+ * ExprStates. ivfflatrescan does not touch this, and does not touch
+ * so->prefilter either.
+ */
+typedef struct IvfflatIncludeColumn
+{
+	AttrNumber	indexAttno;		/* 2 .. includeCount + 1 */
+	int			chainIndex;		/* slot in includeChains[] */
+	TupleDesc	tupdesc;		/* one attribute */
+	TupleTableSlot *slot;
+}			IvfflatIncludeColumn;
+
+typedef enum IvfflatIncludeNodeKind
+{
+	IVF_INCLUDE_LEAF = 1,
+	IVF_INCLUDE_AND = 2,
+	IVF_INCLUDE_OR = 3
+}			IvfflatIncludeNodeKind;
+
+typedef struct IvfflatIncludeNode
+{
+	IvfflatIncludeNodeKind kind;
+	int			chainIndex;		/* IVF_INCLUDE_LEAF: slot in includeChains[] */
+	ExprState  *qual;			/* IVF_INCLUDE_LEAF: compiled predicate */
+	int			nchildren;		/* IVF_INCLUDE_AND / IVF_INCLUDE_OR */
+	struct IvfflatIncludeNode *children;
+}			IvfflatIncludeNode;
+
+typedef struct IvfflatIncludeFilter
+{
+	int			ncolumns;		/* includeCount */
+	IvfflatIncludeNode *root;	/* NULL if no filter */
+	IvfflatIncludeColumn columns[IVFFLAT_MAX_INCLUDE_COLS];
+	ExprContext *econtext;
+	const char *fallbackReason; /* NULL, "memory", or "disabled" */
+}			IvfflatIncludeFilter;
+
+/* Bytes before the center. includeCount comes from the metapage. */
+static inline Size
+IvfflatListHeaderBytes(int includeCount)
+{
+	return MAXALIGN(sizeof(IvfflatListDataV2) + includeCount * sizeof(IvfflatIncludeChain));
+}
+
+static inline IvfflatIncludeChain *
+IvfflatListGetChains(IvfflatListDataV2 *list)
+{
+	return (IvfflatIncludeChain *) ((char *) list + sizeof(IvfflatListDataV2));
+}
+
+static inline Vector *
+IvfflatListGetCenter(IvfflatListDataV2 *list, int includeCount)
+{
+	return (Vector *) ((char *) list + IvfflatListHeaderBytes(includeCount));
+}
+
+static inline uint32
+IvfflatEntryGetId(Item item)
+{
+	return ((IvfflatEntryHeader *) item)->entry_id;
+}
+
+static inline IndexTuple
+IvfflatEntryGetTuple(Item item)
+{
+	return (IndexTuple) ((char *) item + sizeof(uint32));
+}
+
+/* Stored item length: header plus the index tuple, maxaligned. */
+static inline Size
+IvfflatEntrySize(IndexTuple itup)
+{
+	return MAXALIGN(sizeof(uint32) + IndexTupleSize(itup));
+}
+
 typedef struct IvfflatScanList
 {
 	pairingheap_node ph_node;
 	BlockNumber startPage;
+	BlockNumber listBlkno;
+	OffsetNumber listOffno;
 	double		distance;
 }			IvfflatScanList;
+
+typedef struct IvfflatProbeList
+{
+	BlockNumber startPage;
+	BlockNumber listBlkno;
+	OffsetNumber listOffno;
+}			IvfflatProbeList;
 
 typedef struct IvfflatScanOpaqueData
 {
@@ -278,6 +437,8 @@ typedef struct IvfflatScanOpaqueData
 	int			probes;
 	int			maxProbes;
 	int			dimensions;
+	uint32		version;
+	int			includeCount;
 	bool		first;
 	Datum		value;
 	MemoryContext tmpCtx;
@@ -297,12 +458,15 @@ typedef struct IvfflatScanOpaqueData
 
 	/* Lists */
 	pairingheap *listQueue;
-	BlockNumber *listPages;
+	IvfflatProbeList *listPages;
 	int			listIndex;
 	IvfflatScanList *lists;
 
 	/* Pre-filter installed by the IvfPrefilterScan custom node (may be NULL) */
 	IvfflatPrefilter *prefilter;
+
+	/* Include-column filter installed by IvfIncludeScan (may be NULL) */
+	IvfflatIncludeFilter *includeFilter;
 }			IvfflatScanOpaqueData;
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;
@@ -344,12 +508,22 @@ void		IvfflatNormVectors(const IvfflatTypeInfo * typeInfo, Oid collation, Vector
 void		IvfflatCheckMemoryUsage(Size totalSize);
 int			IvfflatGetLists(Relation index);
 void		IvfflatGetMetaPageInfo(Relation index, int *lists, int *dimensions);
+void		IvfflatReadMeta(Relation index, IvfflatMetaInfo *meta);
 void		IvfflatUpdateList(Relation index, ListInfo listInfo, BlockNumber insertPage, BlockNumber originalInsertPage, BlockNumber startPage, ForkNumber forkNum);
+void		IvfflatWriteListV2(Relation index, ListInfo listInfo, int includeCount, BlockNumber startPage, BlockNumber insertPage, BlockNumber dirStartPage, uint32 entry_hwm, uint32 live_count, IvfflatIncludeChain *chains, ForkNumber forkNum);
 void		IvfflatCommitBuffer(Buffer buf, GenericXLogState *state);
-void		IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, ForkNumber forkNum);
+void		IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, ForkNumber forkNum, int version);
 Buffer		IvfflatNewBuffer(Relation index, ForkNumber forkNum);
-void		IvfflatInitPage(Buffer buf, Page page);
-void		IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state);
+void		IvfflatInitPage(Buffer buf, Page page, int version);
+void		IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, int version);
+void		IvfflatPageOpaqueAdd(Page page, uint32 entry_id);
+void		IvfflatPageOpaqueRecompute(Page page);
+Size		IvfflatMaxItemSize(int version);
+Datum		IvfflatPrepareIncludeDatum(Form_pg_attribute att, Datum value, bool isnull);
+TupleDesc	IvfflatOneColumnDesc(Relation index, AttrNumber attnum);
+IndexTuple	IvfflatFormColumnTuple(TupleDesc desc, Datum value, bool isnull, ItemPointer tid);
+char	   *IvfflatFormEntryItem(uint32 entry_id, IndexTuple itup, Size *itemsz);
+Size		IvfflatIncludeMemBudget(void);
 void		IvfflatInit(void);
 void		IvfflatCheckDim(int expected, const IvfflatTypeInfo * typeInfo, Oid collation, Datum value);
 const		IvfflatTypeInfo *IvfflatGetTypeInfo(Relation index);
@@ -365,5 +539,6 @@ IndexScanDesc ivfflatbeginscan(Relation index, int nkeys, int norderbys);
 void		ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		ivfflatgettuple(IndexScanDesc scan, ScanDirection dir);
 void		ivfflatendscan(IndexScanDesc scan);
+void		IvfflatScanSetIncludeFilter(IndexScanDesc scan, IvfflatIncludeFilter *filter);
 
 #endif

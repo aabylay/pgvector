@@ -11,6 +11,7 @@
 #include "halfvec.h"
 #include "hnsw.h"
 #include "ivfflat.h"
+#include "ivfinclude.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
 #include "port.h"				/* for strtof() */
@@ -63,6 +64,7 @@ _PG_init(void)
 	HnswInit();
 	IvfflatInit();
 	IvfflatPrefilterInit();
+	IvfflatIncludeInit();
 }
 
 /*

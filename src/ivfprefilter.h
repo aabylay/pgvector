@@ -12,7 +12,7 @@
  * consulted by the ivfflat scan (GetScanItems) to skip candidates that
  * cannot pass the query's filter.
  *
- * See docs/filtered-ann-ivf-prefilter-customscan-spec.md
+ * See docs/filtered-ivf.md
  */
 typedef struct IvfflatPrefilter IvfflatPrefilter;	/* opaque outside
 													 * ivfprefilter.c */

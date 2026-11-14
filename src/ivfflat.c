@@ -14,6 +14,7 @@
 #include "commands/vacuum.h"
 #include "fmgr.h"
 #include "ivfflat.h"
+#include "ivfinclude.h"
 #include "nodes/pg_list.h"
 #include "utils/catcache.h"
 #include "utils/float.h"
@@ -70,6 +71,14 @@ IvfflatInit(void)
 
 	DefineCustomIntVariable("ivfflat.prefilter_mem", "Sets the memory budget for the prefilter TID set",
 							"-1 means use work_mem.", &ivfflat_prefilter_mem,
+							-1, -1, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("ivfflat.include_filter", "Enables included-column filtering for ivfflat scans",
+							 NULL, &ivfflat_include_filter,
+							 true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ivfflat.include_mem", "Sets the memory budget for the included-column passing set",
+							"-1 means use work_mem.", &ivfflat_include_mem,
 							-1, -1, MAX_KILOBYTES, PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("ivfflat");
@@ -419,7 +428,7 @@ ivfflathandler(PG_FUNCTION_ARGS)
 		.ampredlocks = false,
 		.amcanparallel = false,
 		.amcanbuildparallel = true,
-		.amcaninclude = false,
+		.amcaninclude = true,
 		.amusemaintenanceworkmem = false,
 		.amsummarizing = false,
 		.amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL,
@@ -480,7 +489,7 @@ ivfflathandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 170000
 	amroutine->amcanbuildparallel = true;
 #endif
-	amroutine->amcaninclude = false;
+	amroutine->amcaninclude = true;
 	amroutine->amusemaintenanceworkmem = false; /* not used during VACUUM */
 #if PG_VERSION_NUM >= 160000
 	amroutine->amsummarizing = false;

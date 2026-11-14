@@ -2,6 +2,8 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/itup.h"
+#include "access/tupdesc.h"
 #include "fmgr.h"
 #include "halfutils.h"
 #include "halfvec.h"
@@ -151,24 +153,43 @@ IvfflatNewBuffer(Relation index, ForkNumber forkNum)
 
 /*
  * Init page
+ *
+ * Version 2 uses a wider special area on every page, including the metapage
+ * and list pages. Callers pass the index version; a version-1 index never
+ * contains a version-2 page.
  */
 void
-IvfflatInitPage(Buffer buf, Page page)
+IvfflatInitPage(Buffer buf, Page page, int version)
 {
-	PageInit(page, BufferGetPageSize(buf), sizeof(IvfflatPageOpaqueData));
-	IvfflatPageGetOpaque(page)->nextblkno = InvalidBlockNumber;
-	IvfflatPageGetOpaque(page)->page_id = IVFFLAT_PAGE_ID;
+	if (version == IVFFLAT_VERSION_INCLUDE)
+	{
+		IvfflatPageOpaqueDataV2 *opaque;
+
+		PageInit(page, BufferGetPageSize(buf), sizeof(IvfflatPageOpaqueDataV2));
+		opaque = IvfflatPageGetOpaqueV2(page);
+		opaque->nextblkno = InvalidBlockNumber;
+		opaque->min_entry_id = 0;
+		opaque->max_entry_id = 0;
+		opaque->live_items = 0;
+		opaque->page_id = IVFFLAT_PAGE_ID;
+	}
+	else
+	{
+		PageInit(page, BufferGetPageSize(buf), sizeof(IvfflatPageOpaqueData));
+		IvfflatPageGetOpaque(page)->nextblkno = InvalidBlockNumber;
+		IvfflatPageGetOpaque(page)->page_id = IVFFLAT_PAGE_ID;
+	}
 }
 
 /*
  * Init and register page
  */
 void
-IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state)
+IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, int version)
 {
 	*state = GenericXLogStart(index);
 	*page = GenericXLogRegisterBuffer(*state, *buf, GENERIC_XLOG_FULL_IMAGE);
-	IvfflatInitPage(*buf, *page);
+	IvfflatInitPage(*buf, *page, version);
 }
 
 /*
@@ -187,7 +208,7 @@ IvfflatCommitBuffer(Buffer buf, GenericXLogState *state)
  * The order is very important!!
  */
 void
-IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, ForkNumber forkNum)
+IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, ForkNumber forkNum, int version)
 {
 	/* Get new buffer */
 	Buffer		newbuf = IvfflatNewBuffer(index, forkNum);
@@ -197,7 +218,7 @@ IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **st
 	IvfflatPageGetOpaque(*page)->nextblkno = BufferGetBlockNumber(newbuf);
 
 	/* Init new page */
-	IvfflatInitPage(newbuf, newpage);
+	IvfflatInitPage(newbuf, newpage, version);
 
 	/* Commit */
 	GenericXLogFinish(*state);
@@ -208,6 +229,222 @@ IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **st
 	*state = GenericXLogStart(index);
 	*page = GenericXLogRegisterBuffer(*state, newbuf, GENERIC_XLOG_FULL_IMAGE);
 	*buf = newbuf;
+}
+
+/*
+ * Largest maxaligned item that fits on one page of this index version
+ */
+Size
+IvfflatMaxItemSize(int version)
+{
+	Size		special = (version == IVFFLAT_VERSION_INCLUDE) ? sizeof(IvfflatPageOpaqueDataV2) : sizeof(IvfflatPageOpaqueData);
+	Size		usable;
+
+	usable = (Size) BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(special);
+	if (usable <= sizeof(ItemIdData))
+		return 0;
+
+	usable -= sizeof(ItemIdData);
+
+	return usable - (usable % MAXIMUM_ALIGNOF);
+}
+
+/*
+ * Read the metapage, choosing the struct from the version
+ */
+void
+IvfflatReadMeta(Relation index, IvfflatMetaInfo *meta)
+{
+	Buffer		buf;
+	Page		page;
+	IvfflatMetaPage metap;
+
+	buf = ReadBuffer(index, IVFFLAT_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	metap = IvfflatPageGetMeta(page);
+
+	if (unlikely(metap->magicNumber != IVFFLAT_MAGIC_NUMBER))
+		elog(ERROR, "ivfflat index is not valid");
+
+	memset(meta, 0, sizeof(IvfflatMetaInfo));
+	meta->version = metap->version;
+	meta->lists = metap->lists;
+	meta->dimensions = metap->dimensions;
+
+	if (meta->version == IVFFLAT_VERSION_INCLUDE)
+	{
+		IvfflatMetaPageDataV2 *v2 = (IvfflatMetaPageDataV2 *) PageGetContents(page);
+
+		if (v2->includeCount < 1 || v2->includeCount > IVFFLAT_MAX_INCLUDE_COLS)
+			elog(ERROR, "ivfflat index is not valid");
+
+		meta->includeCount = v2->includeCount;
+		memcpy(meta->includeWidth, v2->includeWidth, sizeof(uint16) * v2->includeCount);
+	}
+	else if (meta->version != IVFFLAT_VERSION)
+		elog(ERROR, "ivfflat index has unsupported version %u", meta->version);
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Record one entry on a version-2 page opaque
+ */
+void
+IvfflatPageOpaqueAdd(Page page, uint32 entry_id)
+{
+	IvfflatPageOpaqueDataV2 *opaque = IvfflatPageGetOpaqueV2(page);
+
+	if (opaque->live_items == 0)
+	{
+		opaque->min_entry_id = entry_id;
+		opaque->max_entry_id = entry_id;
+		opaque->live_items = 1;
+	}
+	else
+	{
+		if (entry_id < opaque->min_entry_id)
+			opaque->min_entry_id = entry_id;
+		if (entry_id > opaque->max_entry_id)
+			opaque->max_entry_id = entry_id;
+		opaque->live_items++;
+	}
+}
+
+/*
+ * Recompute min, max, and live count from the items still on the page
+ */
+void
+IvfflatPageOpaqueRecompute(Page page)
+{
+	IvfflatPageOpaqueDataV2 *opaque = IvfflatPageGetOpaqueV2(page);
+	OffsetNumber maxoffno = PageGetMaxOffsetNumber(page);
+	uint32		min = 0;
+	uint32		max = 0;
+	uint16		live = 0;
+
+	for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+	{
+		Item		item = PageGetItem(page, PageGetItemId(page, offno));
+		uint32		entry_id = IvfflatEntryGetId(item);
+
+		if (live == 0 || entry_id < min)
+			min = entry_id;
+		if (live == 0 || entry_id > max)
+			max = entry_id;
+		live++;
+	}
+
+	opaque->min_entry_id = min;
+	opaque->max_entry_id = max;
+	opaque->live_items = live;
+}
+
+/*
+ * Replace the version-2 list header after a build of one list
+ */
+void
+IvfflatWriteListV2(Relation index, ListInfo listInfo, int includeCount,
+				   BlockNumber startPage, BlockNumber insertPage,
+				   BlockNumber dirStartPage, uint32 entry_hwm, uint32 live_count,
+				   IvfflatIncludeChain *chains, ForkNumber forkNum)
+{
+	Buffer		buf;
+	Page		page;
+	GenericXLogState *state;
+	IvfflatListDataV2 *list;
+
+	buf = ReadBufferExtended(index, forkNum, listInfo.blkno, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	state = GenericXLogStart(index);
+	page = GenericXLogRegisterBuffer(state, buf, 0);
+	list = (IvfflatListDataV2 *) PageGetItem(page, PageGetItemId(page, listInfo.offno));
+
+	list->startPage = startPage;
+	list->insertPage = insertPage;
+	list->dirStartPage = dirStartPage;
+	list->entry_hwm = entry_hwm;
+	list->live_count = live_count;
+
+	if (includeCount > 0)
+		memcpy(IvfflatListGetChains(list), chains, includeCount * sizeof(IvfflatIncludeChain));
+
+	IvfflatCommitBuffer(buf, state);
+}
+
+/*
+ * Detoast an included value and reject anything past the width cap
+ */
+Datum
+IvfflatPrepareIncludeDatum(Form_pg_attribute att, Datum value, bool isnull)
+{
+	if (isnull)
+		return (Datum) 0;
+
+	if (att->attlen < 0)
+	{
+		Datum		detoasted = PointerGetDatum(PG_DETOAST_DATUM(value));
+
+		if (VARSIZE_ANY(DatumGetPointer(detoasted)) > IVFFLAT_MAX_INCLUDE_WIDTH)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("included column value is too large"),
+					 errdetail("Included values must be at most %d bytes.", IVFFLAT_MAX_INCLUDE_WIDTH)));
+
+		return detoasted;
+	}
+
+	return value;
+}
+
+/*
+ * One-attribute tuple descriptor copied from an index column
+ */
+TupleDesc
+IvfflatOneColumnDesc(Relation index, AttrNumber attnum)
+{
+	TupleDesc	src = RelationGetDescr(index);
+	Form_pg_attribute att = TupleDescAttr(src, attnum - 1);
+	TupleDesc	desc = CreateTemplateTupleDesc(1);
+
+	TupleDescInitEntry(desc, 1, NameStr(att->attname), att->atttypid, att->atttypmod, att->attndims);
+	TupleDescInitEntryCollation(desc, 1, att->attcollation);
+#if PG_VERSION_NUM >= 190000
+	TupleDescFinalize(desc);
+#endif
+
+	return desc;
+}
+
+/*
+ * One-attribute index tuple carrying the heap TID
+ */
+IndexTuple
+IvfflatFormColumnTuple(TupleDesc desc, Datum value, bool isnull, ItemPointer tid)
+{
+	IndexTuple	itup = index_form_tuple(desc, &value, &isnull);
+
+	itup->t_tid = *tid;
+
+	return itup;
+}
+
+/*
+ * Version-2 item: entry_id followed immediately by the index tuple
+ */
+char *
+IvfflatFormEntryItem(uint32 entry_id, IndexTuple itup, Size *itemsz)
+{
+	Size		tlen = IndexTupleSize(itup);
+	Size		size = MAXALIGN(sizeof(uint32) + tlen);
+	char	   *item = (char *) palloc0(size);
+
+	memcpy(item, &entry_id, sizeof(uint32));
+	memcpy(item + sizeof(uint32), itup, tlen);
+	*itemsz = size;
+
+	return item;
 }
 
 /*

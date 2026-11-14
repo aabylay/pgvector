@@ -44,6 +44,9 @@ SELECT explain_prefilter($$SELECT id FROM t WHERE category IS NULL ORDER BY val 
 -- <> is not a B-tree strategy: no prefilter
 EXPLAIN (COSTS OFF) SELECT id FROM t WHERE category <> 1 ORDER BY val <-> '[0,0,0]' LIMIT 5;
 
+-- OR expression is not a single B-tree scan key: no prefilter
+EXPLAIN (COSTS OFF) SELECT id FROM t WHERE category = 1 OR category = 2 ORDER BY val <-> '[0,0,0]' LIMIT 5;
+
 -- volatile expressions are not matched: no prefilter
 EXPLAIN (COSTS OFF) SELECT id FROM t WHERE category = (random() * 0)::int4 ORDER BY val <-> '[0,0,0]' LIMIT 5;
 
@@ -139,6 +142,27 @@ ANALYZE t2;
 SELECT explain_prefilter($$SELECT id FROM t2 WHERE name = 'name1' ORDER BY val <-> '[0,0,0]' LIMIT 3$$);
 SELECT id FROM t2 WHERE name = 'name1' ORDER BY val <-> '[0,0,0]' LIMIT 3;
 DROP TABLE t2;
+
+-- row-level security: a clause that is not leakproof is not a B-tree key before the policy
+CREATE TYPE t3_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE t3 (id int4, owner int4, mood t3_mood, val vector(3));
+INSERT INTO t3 SELECT i, i % 10, (ARRAY['sad', 'ok', 'happy'])[1 + i % 3]::t3_mood, ARRAY[i, i, i]::vector FROM generate_series(1, 1000) i;
+CREATE INDEX t3_val_idx ON t3 USING ivfflat (val vector_l2_ops) WITH (lists = 1);
+CREATE INDEX t3_mood_idx ON t3 (mood);
+ANALYZE t3;
+ALTER TABLE t3 ENABLE ROW LEVEL SECURITY;
+CREATE POLICY t3_owner ON t3 USING (owner = 1);
+CREATE ROLE regress_ivf_prefilter_rls;
+GRANT SELECT ON t3 TO regress_ivf_prefilter_rls;
+SET ROLE regress_ivf_prefilter_rls;
+EXPLAIN (COSTS OFF) SELECT id FROM t3 WHERE mood = 'happy' ORDER BY val <-> '[0,0,0]' LIMIT 3;
+SELECT id FROM t3 WHERE mood = 'happy' ORDER BY val <-> '[0,0,0]' LIMIT 3;
+RESET ROLE;
+-- the table owner bypasses the policy, so the B-tree prefilter is used
+EXPLAIN (COSTS OFF) SELECT id FROM t3 WHERE mood = 'happy' ORDER BY val <-> '[0,0,0]' LIMIT 3;
+DROP TABLE t3;
+DROP TYPE t3_mood;
+DROP ROLE regress_ivf_prefilter_rls;
 
 -- partitioned table: one prefilter scan per leaf
 CREATE TABLE pt (id int4, category int4, val vector(3)) PARTITION BY RANGE (id);

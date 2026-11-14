@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include <float.h>
+#include <math.h>
 
 #include "access/amapi.h"
 #include "access/genam.h"
@@ -11,8 +12,12 @@
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "lib/pairingheap.h"
+#include "common/hashfn.h"
+#include "executor/executor.h"
 #include "ivfflat.h"
+#include "ivfinclude.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "utils/memutils.h"
@@ -26,6 +31,52 @@
 
 #define GetScanList(ptr) pairingheap_container(IvfflatScanList, ph_node, ptr)
 #define GetScanListConst(ptr) pairingheap_const_container(IvfflatScanList, ph_node, ptr)
+
+/*
+ * Passing entry ids for one list. A bitmap is used when it fits and the list
+ * is not mostly holes; otherwise a hash of the ids that passed, until that
+ * exceeds the budget and the scan stops filtering.
+ */
+typedef struct IdHashEntry
+{
+	uint32		key;
+	char		status;
+}			IdHashEntry;
+
+static inline uint32
+IdHashKey(uint32 key)
+{
+	return murmurhash32(key);
+}
+
+#define SH_PREFIX idset
+#define SH_ELEMENT_TYPE IdHashEntry
+#define SH_KEY_TYPE uint32
+#define SH_KEY key
+#define SH_HASH_KEY(tb, key) IdHashKey(key)
+#define SH_EQUAL(tb, a, b) ((a) == (b))
+#define SH_SCOPE static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+typedef enum PassKind
+{
+	PASS_NONE = 0,
+	PASS_BITMAP,
+	PASS_HASH,
+	PASS_ALL
+}			PassKind;
+
+typedef struct PassSet
+{
+	PassKind	kind;
+	uint32		hwm;
+	uint32		maxEntries;
+	uint32		members;
+	unsigned char *bits;
+	idset_hash *hash;
+}			PassSet;
 
 /*
  * Compare list distances
@@ -59,6 +110,7 @@ GetScanLists(IndexScanDesc scan, Datum value)
 		Buffer		cbuf;
 		Page		cpage;
 		OffsetNumber maxoffno;
+		BlockNumber listBlk = nextblkno;
 
 		cbuf = ReadBuffer(scan->indexRelation, nextblkno);
 		LockBuffer(cbuf, BUFFER_LOCK_SHARE);
@@ -69,10 +121,16 @@ GetScanLists(IndexScanDesc scan, Datum value)
 		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
 		{
 			IvfflatList list = (IvfflatList) PageGetItem(cpage, PageGetItemId(cpage, offno));
+			Pointer		center;
 			double		distance;
 
+			if (so->version == IVFFLAT_VERSION_INCLUDE)
+				center = (Pointer) IvfflatListGetCenter((IvfflatListDataV2 *) list, so->includeCount);
+			else
+				center = (Pointer) &list->center;
+
 			/* Use procinfo from the index instead of scan key for performance */
-			distance = DatumGetFloat8(so->distfunc(so->procinfo, so->collation, PointerGetDatum(&list->center), value));
+			distance = DatumGetFloat8(so->distfunc(so->procinfo, so->collation, PointerGetDatum(center), value));
 
 			if (listCount < so->maxProbes)
 			{
@@ -80,6 +138,8 @@ GetScanLists(IndexScanDesc scan, Datum value)
 
 				scanlist = &so->lists[listCount];
 				scanlist->startPage = list->startPage;
+				scanlist->listBlkno = listBlk;
+				scanlist->listOffno = offno;
 				scanlist->distance = distance;
 				listCount++;
 
@@ -99,6 +159,8 @@ GetScanLists(IndexScanDesc scan, Datum value)
 
 				/* Reuse */
 				scanlist->startPage = list->startPage;
+				scanlist->listBlkno = listBlk;
+				scanlist->listOffno = offno;
 				scanlist->distance = distance;
 				pairingheap_add(so->listQueue, &scanlist->ph_node);
 
@@ -113,9 +175,541 @@ GetScanLists(IndexScanDesc scan, Datum value)
 	}
 
 	for (int i = listCount - 1; i >= 0; i--)
-		so->listPages[i] = GetScanList(pairingheap_remove_first(so->listQueue))->startPage;
+	{
+		IvfflatScanList *picked = GetScanList(pairingheap_remove_first(so->listQueue));
+
+		so->listPages[i].startPage = picked->startPage;
+		so->listPages[i].listBlkno = picked->listBlkno;
+		so->listPages[i].listOffno = picked->listOffno;
+	}
 
 	Assert(pairingheap_is_empty(so->listQueue));
+}
+
+static PassSet *
+PassCreate(uint32 hwm, uint32 live, Size budget, const char **fallback)
+{
+	PassSet    *set = palloc0_object(PassSet);
+	Size		bytes;
+
+	set->hwm = hwm;
+
+	if (hwm == 0)
+	{
+		set->kind = PASS_NONE;
+		return set;
+	}
+
+	bytes = ((Size) hwm + 7) / 8;
+
+	if (bytes <= budget && (uint64) hwm <= 4ull * (uint64) live)
+	{
+		set->kind = PASS_BITMAP;
+		set->bits = palloc0(bytes);
+		return set;
+	}
+
+	set->maxEntries = (uint32) (budget / 16);
+
+	if (set->maxEntries == 0)
+	{
+		set->kind = PASS_ALL;
+		*fallback = "memory";
+		return set;
+	}
+
+	set->kind = PASS_HASH;
+	set->hash = idset_create(CurrentMemoryContext, 128, NULL);
+	return set;
+}
+
+static PassSet *
+PassEmptyLike(PassSet *src)
+{
+	PassSet    *set = palloc0_object(PassSet);
+
+	set->kind = src->kind;
+	set->hwm = src->hwm;
+	set->maxEntries = src->maxEntries;
+
+	if (set->kind == PASS_BITMAP)
+		set->bits = palloc0(((Size) set->hwm + 7) / 8);
+	else if (set->kind == PASS_HASH)
+		set->hash = idset_create(CurrentMemoryContext, 128, NULL);
+
+	return set;
+}
+
+static void
+PassFree(PassSet *set)
+{
+	if (set == NULL)
+		return;
+
+	if (set->bits != NULL)
+		pfree(set->bits);
+	if (set->hash != NULL)
+		idset_destroy(set->hash);
+	pfree(set);
+}
+
+static bool
+PassAdd(PassSet *set, uint32 id)
+{
+	if (set->kind == PASS_BITMAP)
+	{
+		if (id < set->hwm)
+		{
+			unsigned char mask = (unsigned char) (1u << (id & 7));
+
+			if ((set->bits[id >> 3] & mask) == 0)
+			{
+				set->bits[id >> 3] |= mask;
+				set->members++;
+			}
+		}
+		return true;
+	}
+
+	if (set->kind == PASS_HASH)
+	{
+		bool		found;
+
+		if (set->members >= set->maxEntries)
+		{
+			if (idset_lookup(set->hash, id) != NULL)
+				return true;
+			return false;
+		}
+
+		idset_insert(set->hash, id, &found);
+		if (!found)
+			set->members++;
+		return true;
+	}
+
+	return true;
+}
+
+static bool
+PassHas(PassSet *set, uint32 id)
+{
+	if (set == NULL || set->kind == PASS_ALL)
+		return true;
+	if (set->kind == PASS_NONE || set->members == 0 || id >= set->hwm)
+		return false;
+	if (set->kind == PASS_BITMAP)
+		return (set->bits[id >> 3] & (1u << (id & 7))) != 0;
+
+	return idset_lookup(set->hash, id) != NULL;
+}
+
+static bool
+PassRange(PassSet *set, uint32 minid, uint32 maxid, uint16 live)
+{
+	if (live == 0)
+		return false;
+	if (set == NULL || set->kind == PASS_ALL)
+		return true;
+	if (set->kind == PASS_NONE || set->members == 0 || minid > maxid)
+		return false;
+
+	if (set->kind == PASS_BITMAP)
+	{
+		uint32		id;
+
+		if (minid >= set->hwm)
+			return false;
+		if (maxid >= set->hwm)
+			maxid = set->hwm - 1;
+
+		for (id = minid; id <= maxid; id++)
+		{
+			if (PassHas(set, id))
+				return true;
+		}
+
+		return false;
+	}
+
+	{
+		idset_iterator iter;
+		IdHashEntry *ent;
+
+		idset_start_iterate(set->hash, &iter);
+		while ((ent = idset_iterate(set->hash, &iter)) != NULL)
+		{
+			if (ent->key >= minid && ent->key <= maxid)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/* True when the set passes no id. NULL means no restriction. */
+static bool
+PassIsEmpty(PassSet *set)
+{
+	if (set == NULL || set->kind == PASS_ALL)
+		return false;
+
+	return set->kind == PASS_NONE || set->members == 0;
+}
+
+/*
+ * Score the entries on one vector page. Version-2 items are unwrapped first.
+ * checkSet skips ids the column chains rejected. The TID prefilter is
+ * independent and still applies.
+ */
+static void
+ScoreVectorPage(IndexScanDesc scan, Page page, Datum value, PassSet *set, bool checkSet)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
+	TupleTableSlot *slot = so->vslot;
+	OffsetNumber maxoffno = PageGetMaxOffsetNumber(page);
+	bool		version2 = so->version == IVFFLAT_VERSION_INCLUDE;
+
+	for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+	{
+		Item		item = PageGetItem(page, PageGetItemId(page, offno));
+		IndexTuple	itup;
+		Datum		datum;
+		bool		isnull;
+
+		if (version2)
+		{
+			if (checkSet && !PassHas(set, IvfflatEntryGetId(item)))
+				continue;
+
+			itup = IvfflatEntryGetTuple(item);
+		}
+		else
+			itup = (IndexTuple) item;
+
+		if (so->prefilter != NULL &&
+			!IvfflatPrefilterContains(so->prefilter, &itup->t_tid))
+			continue;
+
+		datum = index_getattr(itup, 1, tupdesc, &isnull);
+
+		if (isnull)
+			continue;
+
+		ExecClearTuple(slot);
+		slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
+		slot->tts_isnull[0] = false;
+		slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
+		slot->tts_isnull[1] = false;
+		ExecStoreVirtualTuple(slot);
+
+		tuplesort_puttupleslot(so->sortstate, slot);
+	}
+}
+
+static void
+ScanVectorChain(IndexScanDesc scan, BlockNumber searchPage, Datum value, PassSet *set, bool checkSet)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+
+	while (BlockNumberIsValid(searchPage))
+	{
+		Buffer		buf;
+		Page		page;
+
+		buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		ScoreVectorPage(scan, page, value, set, checkSet);
+		searchPage = IvfflatPageGetOpaque(page)->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+/*
+ * Count directory hits, then either walk the vector chain or read the
+ * surviving pages. pages/hits are filled on the counting pass.
+ */
+static void
+ScanVectorsUsingDirectory(IndexScanDesc scan, BlockNumber startPage, BlockNumber dirStart,
+						  PassSet *set, Datum value)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	double		seqCost = seq_page_cost;
+	double		localCost = seq_page_cost + 0.5 * (random_page_cost - seq_page_cost);
+	double		pages = 0;
+	double		hits = 0;
+	BlockNumber dirBlk = dirStart;
+
+	if (!BlockNumberIsValid(dirStart))
+		return;
+	if (PassIsEmpty(set))
+		return;
+
+	while (BlockNumberIsValid(dirBlk))
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoffno;
+
+		buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, dirBlk, RBM_NORMAL, so->bas);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoffno = PageGetMaxOffsetNumber(page);
+
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+		{
+			IvfflatVectorDirEntry *ent = (IvfflatVectorDirEntry *) PageGetItem(page, PageGetItemId(page, offno));
+
+			pages++;
+			if (ent->live_items > 0 &&
+				PassRange(set, ent->min_entry_id, ent->max_entry_id, ent->live_items))
+				hits++;
+		}
+
+		dirBlk = IvfflatPageGetOpaque(page)->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (pages == 0)
+		return;
+
+	if (hits * localCost >= pages * seqCost)
+	{
+		ScanVectorChain(scan, startPage, value, set, true);
+		return;
+	}
+
+	dirBlk = dirStart;
+
+	while (BlockNumberIsValid(dirBlk))
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoffno;
+
+		buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, dirBlk, RBM_NORMAL, so->bas);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoffno = PageGetMaxOffsetNumber(page);
+
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+		{
+			IvfflatVectorDirEntry *ent = (IvfflatVectorDirEntry *) PageGetItem(page, PageGetItemId(page, offno));
+			Buffer		vbuf;
+			Page		vpage;
+
+			if (ent->live_items == 0 ||
+				!PassRange(set, ent->min_entry_id, ent->max_entry_id, ent->live_items))
+				continue;
+
+			vbuf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, ent->blkno, RBM_NORMAL, so->bas);
+			LockBuffer(vbuf, BUFFER_LOCK_SHARE);
+			vpage = BufferGetPage(vbuf);
+			ScoreVectorPage(scan, vpage, value, set, true);
+			UnlockReleaseBuffer(vbuf);
+		}
+
+		dirBlk = IvfflatPageGetOpaque(page)->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+static void
+CopyListHeaderV2(Relation index, IvfflatProbeList *ref, int includeCount,
+				 IvfflatListDataV2 *header, IvfflatIncludeChain *chains)
+{
+	Buffer		buf = ReadBuffer(index, ref->listBlkno);
+	Page		page;
+	IvfflatListDataV2 *list;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	list = (IvfflatListDataV2 *) PageGetItem(page, PageGetItemId(page, ref->listOffno));
+	memcpy(header, list, sizeof(IvfflatListDataV2));
+
+	if (includeCount > 0)
+		memcpy(chains, IvfflatListGetChains(list), includeCount * sizeof(IvfflatIncludeChain));
+
+	UnlockReleaseBuffer(buf);
+}
+
+/* Chain walk state for one list */
+typedef struct IncludeEval
+{
+	IndexScanDesc scan;
+	IvfflatIncludeFilter *filter;
+	IvfflatIncludeChain *chains;
+	uint32		hwm;
+	PassSet    *proto;			/* kind and capacity of scratch sets */
+}			IncludeEval;
+
+/*
+ * Walk the leaf's chain and add to out each id in cand (every id when NULL)
+ * whose value passes the leaf quals. Ids in out or done are skipped. False
+ * when out is over budget.
+ */
+static bool
+EvalIncludeLeaf(IncludeEval *ev, IvfflatIncludeNode *node, PassSet *cand,
+				PassSet *done, PassSet *out)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) ev->scan->opaque;
+	IvfflatIncludeColumn *col = &ev->filter->columns[node->chainIndex];
+	ExprContext *econtext = ev->filter->econtext;
+	BlockNumber searchPage = ev->chains[node->chainIndex].startPage;
+
+	while (BlockNumberIsValid(searchPage))
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoffno;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBufferExtended(ev->scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoffno = PageGetMaxOffsetNumber(page);
+		ResetExprContext(econtext);
+
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+		{
+			Item		item = PageGetItem(page, PageGetItemId(page, offno));
+			uint32		entry_id = IvfflatEntryGetId(item);
+			Datum		datum;
+			bool		isnull;
+
+			if (entry_id >= ev->hwm)
+				continue;
+			if (cand != NULL && !PassHas(cand, entry_id))
+				continue;
+			if (PassHas(out, entry_id) || (done != NULL && PassHas(done, entry_id)))
+				continue;
+
+			datum = index_getattr(IvfflatEntryGetTuple(item), 1, col->tupdesc, &isnull);
+			ExecClearTuple(col->slot);
+			col->slot->tts_values[0] = datum;
+			col->slot->tts_isnull[0] = isnull;
+			ExecStoreVirtualTuple(col->slot);
+			econtext->ecxt_scantuple = col->slot;
+
+			if (!ExecQual(node->qual, econtext))
+				continue;
+
+			if (!PassAdd(out, entry_id))
+			{
+				UnlockReleaseBuffer(buf);
+				return false;
+			}
+		}
+
+		searchPage = IvfflatPageGetOpaque(page)->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+
+	return true;
+}
+
+/*
+ * Add to out each id in cand (every id when NULL) that passes node. Ids in
+ * done are already accepted higher up and are skipped. An AND narrows a
+ * scratch set child by child and its last child writes to out. False when a
+ * set is over budget.
+ */
+static bool
+EvalIncludeNode(IncludeEval *ev, IvfflatIncludeNode *node, PassSet *cand,
+				PassSet *done, PassSet *out)
+{
+	PassSet    *cur;
+	int			last;
+	bool		ok = true;
+
+	check_stack_depth();
+
+	if (PassIsEmpty(cand))
+		return true;
+
+	if (node->kind == IVF_INCLUDE_LEAF)
+		return EvalIncludeLeaf(ev, node, cand, done, out);
+
+	if (node->kind == IVF_INCLUDE_OR)
+	{
+		for (int i = 0; i < node->nchildren; i++)
+		{
+			if (!EvalIncludeNode(ev, &node->children[i], cand, done, out))
+				return false;
+		}
+
+		return true;
+	}
+
+	cur = cand;
+	last = node->nchildren - 1;
+
+	for (int i = 0; i < last && ok && !PassIsEmpty(cur); i++)
+	{
+		PassSet    *next = PassEmptyLike(ev->proto);
+
+		/* Ids already in out need no more work at this level */
+		ok = EvalIncludeNode(ev, &node->children[i], cur, out, next);
+		if (cur != cand)
+			PassFree(cur);
+		cur = next;
+	}
+
+	if (ok && !PassIsEmpty(cur))
+		ok = EvalIncludeNode(ev, &node->children[last], cur, done, out);
+
+	if (cur != cand)
+		PassFree(cur);
+
+	return ok;
+}
+
+/*
+ * Build the passing set for one list and score the vectors that survive.
+ * A budget miss scores every vector in the list and lets the child Filter
+ * reject them.
+ */
+static void
+ScanIncludedList(IndexScanDesc scan, IvfflatProbeList *ref, Datum value)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	IvfflatIncludeFilter *filter = so->includeFilter;
+	IvfflatListDataV2 header;
+	IncludeEval ev;
+	PassSet    *set;
+	const char *fallback = NULL;
+
+	ev.scan = scan;
+	ev.filter = filter;
+	ev.chains = palloc0_array_checked(IvfflatIncludeChain, so->includeCount);
+	CopyListHeaderV2(scan->indexRelation, ref, so->includeCount, &header, ev.chains);
+	ev.hwm = header.entry_hwm;
+
+	set = PassCreate(header.entry_hwm, header.live_count, IvfflatIncludeMemBudget(), &fallback);
+	ev.proto = set;
+
+	if (fallback != NULL && filter->fallbackReason == NULL)
+		filter->fallbackReason = fallback;
+
+	if (set->kind == PASS_ALL)
+		ScanVectorChain(scan, header.startPage, value, NULL, false);
+	else if (set->kind != PASS_NONE)
+	{
+		if (EvalIncludeNode(&ev, filter->root, NULL, NULL, set))
+			ScanVectorsUsingDirectory(scan, header.startPage, header.dirStartPage, set, value);
+		else
+		{
+			if (filter->fallbackReason == NULL)
+				filter->fallbackReason = "memory";
+			ScanVectorChain(scan, header.startPage, value, NULL, false);
+		}
+	}
+
+	PassFree(set);
+	pfree(ev.chains);
 }
 
 /*
@@ -125,68 +719,27 @@ static void
 GetScanItems(IndexScanDesc scan, Datum value)
 {
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
-	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
-	TupleTableSlot *slot = so->vslot;
 	int			batchProbes = 0;
+	bool		useInclude = so->includeFilter != NULL && so->includeFilter->root != NULL;
+
+	if (useInclude && !ivfflat_include_filter)
+	{
+		if (so->includeFilter->fallbackReason == NULL)
+			so->includeFilter->fallbackReason = "disabled";
+		useInclude = false;
+	}
 
 	tuplesort_reset(so->sortstate);
 
 	/* Search closest probes lists */
 	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
 	{
-		BlockNumber searchPage = so->listPages[so->listIndex++];
+		IvfflatProbeList ref = so->listPages[so->listIndex++];
 
-		/* Search all entry pages for list */
-		while (BlockNumberIsValid(searchPage))
-		{
-			Buffer		buf;
-			Page		page;
-			OffsetNumber maxoffno;
-
-			buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			maxoffno = PageGetMaxOffsetNumber(page);
-
-			for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
-			{
-				IndexTuple	itup;
-				Datum		datum;
-				bool		isnull;
-				ItemId		itemid = PageGetItemId(page, offno);
-
-				itup = (IndexTuple) PageGetItem(page, itemid);
-
-				/*
-				 * Skip tuples that cannot pass the query's filter before
-				 * computing their distance (see ivfprefilter.c)
-				 */
-				if (so->prefilter != NULL &&
-					!IvfflatPrefilterContains(so->prefilter, &itup->t_tid))
-					continue;
-
-				datum = index_getattr(itup, 1, tupdesc, &isnull);
-
-				/*
-				 * Add virtual tuple
-				 *
-				 * Use procinfo from the index instead of scan key for
-				 * performance
-				 */
-				ExecClearTuple(slot);
-				slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
-				slot->tts_isnull[0] = false;
-				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
-				slot->tts_isnull[1] = false;
-				ExecStoreVirtualTuple(slot);
-
-				tuplesort_puttupleslot(so->sortstate, slot);
-			}
-
-			searchPage = IvfflatPageGetOpaque(page)->nextblkno;
-
-			UnlockReleaseBuffer(buf);
-		}
+		if (so->version == IVFFLAT_VERSION_INCLUDE && useInclude)
+			ScanIncludedList(scan, &ref, value);
+		else
+			ScanVectorChain(scan, ref.startPage, value, NULL, false);
 	}
 
 	tuplesort_performsort(so->sortstate);
@@ -272,11 +825,14 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	int			probes = ivfflat_probes;
 	int			maxProbes;
 	MemoryContext oldCtx;
+	IvfflatMetaInfo meta;
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
 	/* Get lists and dimensions from metapage */
-	IvfflatGetMetaPageInfo(index, &lists, &dimensions);
+	IvfflatReadMeta(index, &meta);
+	lists = meta.lists;
+	dimensions = meta.dimensions;
 
 	if (ivfflat_iterative_scan != IVFFLAT_ITERATIVE_SCAN_OFF)
 		maxProbes = Max(ivfflat_max_probes, probes);
@@ -302,6 +858,9 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	 * nothing else in the AM (including ivfflatrescan) writes it
 	 */
 	so->prefilter = NULL;
+	so->includeFilter = NULL;
+	so->version = meta.version;
+	so->includeCount = meta.includeCount;
 
 	/* Set support functions */
 	so->procinfo = index_getprocinfo(index, 1, IVFFLAT_DISTANCE_PROC);
@@ -337,7 +896,7 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->bas = GetAccessStrategy(BAS_BULKREAD);
 
 	so->listQueue = pairingheap_allocate(CompareLists, scan);
-	so->listPages = palloc_array_checked(BlockNumber, maxProbes);
+	so->listPages = palloc_array_checked(IvfflatProbeList, maxProbes);
 	so->listIndex = 0;
 	so->lists = palloc_array_checked(IvfflatScanList, maxProbes);
 
@@ -450,6 +1009,24 @@ IvfflatScanSetPrefilter(IndexScanDesc scan, IvfflatPrefilter * pf)
 
 	so = (IvfflatScanOpaque) scan->opaque;
 	so->prefilter = pf;
+}
+
+/*
+ * Install the included-column filter for this scan. Only the include custom
+ * scan writes this pointer. NULL clears it.
+ */
+void
+IvfflatScanSetIncludeFilter(IndexScanDesc scan, IvfflatIncludeFilter *filter)
+{
+	IvfflatScanOpaque so;
+
+	if (scan == NULL || scan->indexRelation == NULL ||
+		scan->indexRelation->rd_indam == NULL ||
+		scan->indexRelation->rd_indam->ambeginscan != ivfflatbeginscan)
+		elog(ERROR, "cannot set include filter on non-ivfflat scan");
+
+	so = (IvfflatScanOpaque) scan->opaque;
+	so->includeFilter = filter;
 }
 
 /*

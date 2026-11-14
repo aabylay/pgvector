@@ -12,3 +12,19 @@ regression.*
 *.obj
 *.lib
 *.exp
+.scratch/
+__pycache__/
+*.pyc
+
+# Specs, scratch checks, and local tests. docs/filtered-ivf.md,
+# docs/filtered-ivf-code-walkthrough.md, and the include-scan tests stay tracked.
+docs/*
+!docs/filtered-ivf.md
+!docs/filtered-ivf-code-walkthrough.md
+test/**
+!test/sql/
+!test/expected/
+!test/t/
+!test/sql/ivfflat_include.sql
+!test/expected/ivfflat_include.out
+!test/t/049_ivfflat_include_recall.pl

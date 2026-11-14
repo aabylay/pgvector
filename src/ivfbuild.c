@@ -150,7 +150,7 @@ SampleRows(IvfflatBuildState * buildstate)
  * Add tuple to sort
  */
 static void
-AddTupleToSort(ItemPointer tid, Datum *values, IvfflatBuildState * buildstate)
+AddTupleToSort(ItemPointer tid, Datum *values, bool *isnull, IvfflatBuildState * buildstate)
 {
 	double		distance;
 	double		minDistance = DBL_MAX;
@@ -199,6 +199,15 @@ AddTupleToSort(ItemPointer tid, Datum *values, IvfflatBuildState * buildstate)
 	slot->tts_isnull[1] = false;
 	slot->tts_values[2] = value;
 	slot->tts_isnull[2] = false;
+
+	for (int i = 0; i < buildstate->includeCount; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(buildstate->tupdesc, i + 1);
+
+		slot->tts_isnull[3 + i] = isnull[i + 1];
+		slot->tts_values[3 + i] = IvfflatPrepareIncludeDatum(att, values[i + 1], isnull[i + 1]);
+	}
+
 	ExecStoreVirtualTuple(slot);
 
 	/*
@@ -230,7 +239,7 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
 
 	/* Add tuple to sort */
-	AddTupleToSort(tid, values, buildstate);
+	AddTupleToSort(tid, values, isnull, buildstate);
 
 	/* Reset memory context */
 	MemoryContextSwitchTo(oldCtx);
@@ -260,6 +269,214 @@ GetNextTuple(Tuplesortstate *sortstate, TupleDesc tupdesc, TupleTableSlot *slot,
 }
 
 /*
+ * One open page chain during a version-2 build
+ */
+typedef struct BuildChain
+{
+	Buffer		buf;
+	Page		page;
+	GenericXLogState *state;
+	BlockNumber startPage;
+	BlockNumber insertPage;
+	bool		active;
+}			BuildChain;
+
+static void
+BuildChainReset(BuildChain *chain)
+{
+	chain->buf = InvalidBuffer;
+	chain->page = NULL;
+	chain->state = NULL;
+	chain->startPage = InvalidBlockNumber;
+	chain->insertPage = InvalidBlockNumber;
+	chain->active = false;
+}
+
+static void
+BuildChainFinish(BuildChain *chain)
+{
+	if (!chain->active)
+		return;
+
+	IvfflatCommitBuffer(chain->buf, chain->state);
+	chain->active = false;
+	chain->buf = InvalidBuffer;
+	chain->page = NULL;
+	chain->state = NULL;
+}
+
+static void
+BuildChainEnsure(Relation index, BuildChain *chain, ForkNumber forkNum, Size itemsz)
+{
+	if (!chain->active)
+	{
+		chain->buf = IvfflatNewBuffer(index, forkNum);
+		IvfflatInitRegisterPage(index, &chain->buf, &chain->page, &chain->state, IVFFLAT_VERSION_INCLUDE);
+		chain->startPage = chain->insertPage = BufferGetBlockNumber(chain->buf);
+		chain->active = true;
+		return;
+	}
+
+	if (PageGetFreeSpace(chain->page) < itemsz)
+	{
+		IvfflatAppendPage(index, &chain->buf, &chain->page, &chain->state, forkNum, IVFFLAT_VERSION_INCLUDE);
+		chain->insertPage = BufferGetBlockNumber(chain->buf);
+	}
+}
+
+static void
+BuildChainAddEntry(Relation index, BuildChain *chain, ForkNumber forkNum, char *item, Size itemsz, uint32 entry_id)
+{
+	BuildChainEnsure(index, chain, forkNum, itemsz);
+
+	if (PageAddItem(chain->page, (Item) item, itemsz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+	IvfflatPageOpaqueAdd(chain->page, entry_id);
+}
+
+static OffsetNumber
+BuildDirAppend(Relation index, BuildChain *dir, ForkNumber forkNum, BlockNumber blkno, uint32 entry_id)
+{
+	IvfflatVectorDirEntry ent;
+	OffsetNumber offno;
+
+	ent.blkno = blkno;
+	ent.min_entry_id = entry_id;
+	ent.max_entry_id = entry_id;
+	ent.live_items = 1;
+	ent.unused = 0;
+
+	BuildChainEnsure(index, dir, forkNum, sizeof(ent));
+	offno = PageAddItem(dir->page, (Item) &ent, sizeof(ent), InvalidOffsetNumber, false, false);
+	if (offno == InvalidOffsetNumber)
+		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+	return offno;
+}
+
+static void
+BuildDirBump(Page page, OffsetNumber offno, uint32 entry_id)
+{
+	IvfflatVectorDirEntry *ent;
+
+	ent = (IvfflatVectorDirEntry *) PageGetItem(page, PageGetItemId(page, offno));
+
+	if (entry_id < ent->min_entry_id)
+		ent->min_entry_id = entry_id;
+	if (entry_id > ent->max_entry_id)
+		ent->max_entry_id = entry_id;
+	ent->live_items++;
+}
+
+/*
+ * Version-2 entry pages: one item per included column, then the vector item
+ */
+static void
+InsertTuplesV2(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
+{
+	int			list;
+	IndexTuple	itup = NULL;
+	int64		inserted = 0;
+	int			includeCount = buildstate->includeCount;
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(buildstate->sortdesc, &TTSOpsMinimalTuple);
+	BuildChain *columns;
+	BuildChain	vector;
+	BuildChain	dir;
+
+	columns = palloc_array_checked(BuildChain, includeCount);
+
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_IVFFLAT_PHASE_LOAD);
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL, buildstate->indtuples);
+
+	GetNextTuple(buildstate->sortstate, buildstate->vectorDesc, slot, &itup, &list);
+
+	for (int i = 0; i < buildstate->centers->length; i++)
+	{
+		uint32		entry_id = 0;
+		BlockNumber vecBlk = InvalidBlockNumber;
+		OffsetNumber dirOff = InvalidOffsetNumber;
+
+		CHECK_FOR_INTERRUPTS();
+
+		for (int c = 0; c < includeCount; c++)
+			BuildChainReset(&columns[c]);
+		BuildChainReset(&vector);
+		BuildChainReset(&dir);
+
+		while (list == i)
+		{
+			ItemPointer tid;
+			bool		tidnull;
+			BlockNumber now;
+
+			tid = (ItemPointer) DatumGetPointer(slot_getattr(slot, 2, &tidnull));
+
+			for (int c = 0; c < includeCount; c++)
+			{
+				bool		isnull;
+				Datum		value = slot_getattr(slot, (AttrNumber) (4 + c), &isnull);
+				IndexTuple	coltup = IvfflatFormColumnTuple(buildstate->includeDescs[c], value, isnull, tid);
+				Size		itemsz;
+				char	   *item = IvfflatFormEntryItem(entry_id, coltup, &itemsz);
+
+				BuildChainAddEntry(index, &columns[c], forkNum, item, itemsz, entry_id);
+				pfree(item);
+				pfree(coltup);
+			}
+
+			{
+				Size		itemsz;
+				char	   *item = IvfflatFormEntryItem(entry_id, itup, &itemsz);
+
+				BuildChainAddEntry(index, &vector, forkNum, item, itemsz, entry_id);
+				pfree(item);
+			}
+
+			now = BufferGetBlockNumber(vector.buf);
+			if (now != vecBlk)
+			{
+				dirOff = BuildDirAppend(index, &dir, forkNum, now, entry_id);
+				vecBlk = now;
+			}
+			else
+				BuildDirBump(dir.page, dirOff, entry_id);
+
+			pfree(itup);
+
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++inserted);
+			entry_id++;
+
+			GetNextTuple(buildstate->sortstate, buildstate->vectorDesc, slot, &itup, &list);
+		}
+
+		for (int c = 0; c < includeCount; c++)
+			BuildChainFinish(&columns[c]);
+		BuildChainFinish(&vector);
+		BuildChainFinish(&dir);
+
+		if (entry_id > 0)
+		{
+			IvfflatIncludeChain *chains = palloc_array_checked(IvfflatIncludeChain, includeCount);
+
+			for (int c = 0; c < includeCount; c++)
+			{
+				chains[c].startPage = columns[c].startPage;
+				chains[c].insertPage = columns[c].insertPage;
+			}
+
+			IvfflatWriteListV2(index, buildstate->listInfo[i], includeCount,
+							   vector.startPage, vector.insertPage, dir.startPage,
+							   entry_id, entry_id, chains, forkNum);
+			pfree(chains);
+		}
+	}
+
+	pfree(columns);
+	ExecDropSingleTupleTableSlot(slot);
+}
+
+/*
  * Create initial entry pages
  */
 static void
@@ -268,9 +485,17 @@ InsertTuples(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
 	int			list;
 	IndexTuple	itup = NULL;	/* silence compiler warning */
 	int64		inserted = 0;
+	TupleTableSlot *slot;
+	TupleDesc	tupdesc;
 
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(buildstate->sortdesc, &TTSOpsMinimalTuple);
-	TupleDesc	tupdesc = buildstate->tupdesc;
+	if (buildstate->version == IVFFLAT_VERSION_INCLUDE)
+	{
+		InsertTuplesV2(index, buildstate, forkNum);
+		return;
+	}
+
+	slot = MakeSingleTupleTableSlot(buildstate->sortdesc, &TTSOpsMinimalTuple);
+	tupdesc = buildstate->tupdesc;
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_IVFFLAT_PHASE_LOAD);
 
@@ -290,10 +515,10 @@ InsertTuples(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
 		/* Needs to be called when no buffer locks are held */
 		CHECK_FOR_INTERRUPTS();
 
-		buf = IvfflatNewBuffer(index, forkNum);
-		IvfflatInitRegisterPage(index, &buf, &page, &state);
+	buf = IvfflatNewBuffer(index, forkNum);
+	IvfflatInitRegisterPage(index, &buf, &page, &state, buildstate->version);
 
-		startPage = BufferGetBlockNumber(buf);
+	startPage = BufferGetBlockNumber(buf);
 
 		/* Get all tuples for list */
 		while (list == i)
@@ -302,7 +527,7 @@ InsertTuples(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
 			Size		itemsz = MAXALIGN(IndexTupleSize(itup));
 
 			if (PageGetFreeSpace(page) < itemsz)
-				IvfflatAppendPage(index, &buf, &page, &state, forkNum);
+				IvfflatAppendPage(index, &buf, &page, &state, forkNum, buildstate->version);
 
 			/* Add the item */
 			if (PageAddItem(page, (Item) itup, itemsz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
@@ -322,6 +547,104 @@ InsertTuples(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
 		/* Set the start and insert pages */
 		IvfflatUpdateList(index, buildstate->listInfo[i], insertPage, InvalidBlockNumber, startPage, forkNum);
 	}
+}
+
+/*
+ * Acceptance bound for one included column, or an error if the type cannot
+ * live in a column chain
+ */
+static uint16
+IncludeColumnBound(Form_pg_attribute att)
+{
+	if (att->attlen > 0)
+	{
+		if (att->attlen > IVFFLAT_MAX_INCLUDE_WIDTH)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("included column type is not supported for ivfflat index"),
+					 errdetail("Fixed-length included columns must be at most %d bytes.",
+							   IVFFLAT_MAX_INCLUDE_WIDTH)));
+
+		return (uint16) att->attlen;
+	}
+
+	if ((att->atttypid == VARCHAROID || att->atttypid == BPCHAROID) &&
+		att->atttypmod >= (int32) VARHDRSZ)
+	{
+		int			maxlen = att->atttypmod - VARHDRSZ;
+
+		if (maxlen > IVFFLAT_MAX_INCLUDE_WIDTH)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("included column type is not supported for ivfflat index"),
+					 errdetail("varchar and char included columns must be at most %d characters.",
+							   IVFFLAT_MAX_INCLUDE_WIDTH)));
+
+		return IVFFLAT_MAX_INCLUDE_WIDTH;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("included column type is not supported for ivfflat index"),
+			 errdetail("Included columns must be fixed-length, varchar(n), or char(n), with n at most %d.",
+					   IVFFLAT_MAX_INCLUDE_WIDTH)));
+
+	return 0;
+}
+
+/*
+ * Version-2 indexes are exactly the ones with included columns
+ */
+static void
+CheckIncludedColumns(IvfflatBuildState * buildstate)
+{
+	IndexInfo  *indexInfo = buildstate->indexInfo;
+	TupleDesc	tupdesc = buildstate->tupdesc;
+	int			nkeys;
+	int			natts;
+	Size		listBytes;
+
+	buildstate->includeCount = 0;
+	buildstate->version = IVFFLAT_VERSION;
+	buildstate->vectorDesc = NULL;
+	buildstate->includeDescs = NULL;
+	memset(buildstate->includeWidth, 0, sizeof(buildstate->includeWidth));
+
+	if (indexInfo == NULL)
+		return;
+
+	nkeys = indexInfo->ii_NumIndexKeyAttrs;
+	natts = indexInfo->ii_NumIndexAttrs;
+
+	if (nkeys != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ivfflat indexes support only one key column")));
+
+	if (natts <= nkeys)
+		return;
+
+	buildstate->includeCount = natts - nkeys;
+
+	if (buildstate->includeCount > IVFFLAT_MAX_INCLUDE_COLS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("included columns do not fit on an ivfflat list page"),
+				 errdetail("An ivfflat index supports at most %d included columns.",
+						   IVFFLAT_MAX_INCLUDE_COLS)));
+
+	for (int i = 0; i < buildstate->includeCount; i++)
+		buildstate->includeWidth[i] = IncludeColumnBound(TupleDescAttr(tupdesc, i + 1));
+
+	listBytes = IvfflatListHeaderBytes(buildstate->includeCount) + buildstate->typeInfo->itemSize(buildstate->dimensions);
+	if (MAXALIGN(listBytes) > IvfflatMaxItemSize(IVFFLAT_VERSION_INCLUDE))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("included columns do not fit on an ivfflat list page"),
+				 errdetail("The list item for %d dimensions and %d included columns is larger than a page.",
+						   buildstate->dimensions, buildstate->includeCount)));
+
+	buildstate->version = IVFFLAT_VERSION_INCLUDE;
 }
 
 /*
@@ -371,11 +694,30 @@ InitBuildState(IvfflatBuildState * buildstate, Relation heap, Relation index, In
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dimensions must be greater than one for this opclass")));
 
+	CheckIncludedColumns(buildstate);
+
 	/* Create tuple description for sorting */
-	buildstate->sortdesc = CreateTemplateTupleDesc(3);
+	buildstate->sortdesc = CreateTemplateTupleDesc(3 + buildstate->includeCount);
 	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 1, "list", INT4OID, -1, 0);
 	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 2, "tid", TIDOID, -1, 0);
 	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 3, "vector", TupleDescAttr(buildstate->tupdesc, 0)->atttypid, -1, 0);
+
+	if (buildstate->includeCount > 0)
+	{
+		buildstate->vectorDesc = IvfflatOneColumnDesc(index, 1);
+		buildstate->includeDescs = palloc_array_checked(TupleDesc, buildstate->includeCount);
+
+		for (int i = 0; i < buildstate->includeCount; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(buildstate->tupdesc, i + 1);
+
+			TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) (4 + i), NameStr(att->attname),
+							   att->atttypid, att->atttypmod, att->attndims);
+			TupleDescInitEntryCollation(buildstate->sortdesc, (AttrNumber) (4 + i), att->attcollation);
+			buildstate->includeDescs[i] = IvfflatOneColumnDesc(index, (AttrNumber) (i + 2));
+		}
+	}
+
 #if PG_VERSION_NUM >= 190000
 	TupleDescFinalize(buildstate->sortdesc);
 #endif
@@ -413,6 +755,16 @@ FreeBuildState(IvfflatBuildState * buildstate)
 {
 	VectorArrayFree(buildstate->centers);
 	pfree(buildstate->listInfo);
+
+	if (buildstate->vectorDesc != NULL)
+		FreeTupleDesc(buildstate->vectorDesc);
+
+	if (buildstate->includeDescs != NULL)
+	{
+		for (int i = 0; i < buildstate->includeCount; i++)
+			FreeTupleDesc(buildstate->includeDescs[i]);
+		pfree(buildstate->includeDescs);
+	}
 
 #ifdef IVFFLAT_KMEANS_DEBUG
 	pfree(buildstate->listSums);
@@ -477,7 +829,7 @@ ComputeCenters(IvfflatBuildState * buildstate)
  * Create the metapage
  */
 static void
-CreateMetaPage(Relation index, int dimensions, int lists, ForkNumber forkNum)
+CreateMetaPage(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
 {
 	Buffer		buf;
 	Page		page;
@@ -485,16 +837,32 @@ CreateMetaPage(Relation index, int dimensions, int lists, ForkNumber forkNum)
 	IvfflatMetaPage metap;
 
 	buf = IvfflatNewBuffer(index, forkNum);
-	IvfflatInitRegisterPage(index, &buf, &page, &state);
+	IvfflatInitRegisterPage(index, &buf, &page, &state, buildstate->version);
 
 	/* Set metapage data */
 	metap = IvfflatPageGetMeta(page);
 	metap->magicNumber = IVFFLAT_MAGIC_NUMBER;
-	metap->version = IVFFLAT_VERSION;
-	metap->dimensions = dimensions;
-	metap->lists = lists;
-	((PageHeader) page)->pd_lower =
-		((char *) metap + sizeof(IvfflatMetaPageData)) - (char *) page;
+	metap->dimensions = buildstate->dimensions;
+	metap->lists = buildstate->lists;
+
+	if (buildstate->version == IVFFLAT_VERSION_INCLUDE)
+	{
+		IvfflatMetaPageDataV2 *metap2 = (IvfflatMetaPageDataV2 *) PageGetContents(page);
+
+		metap->version = IVFFLAT_VERSION_INCLUDE;
+		metap2->includeCount = buildstate->includeCount;
+		memset(metap2->includeWidth, 0, sizeof(metap2->includeWidth));
+		memcpy(metap2->includeWidth, buildstate->includeWidth,
+			   sizeof(uint16) * buildstate->includeCount);
+		((PageHeader) page)->pd_lower =
+			((char *) metap2 + sizeof(IvfflatMetaPageDataV2)) - (char *) page;
+	}
+	else
+	{
+		metap->version = IVFFLAT_VERSION;
+		((PageHeader) page)->pd_lower =
+			((char *) metap + sizeof(IvfflatMetaPageData)) - (char *) page;
+	}
 
 	IvfflatCommitBuffer(buf, state);
 }
@@ -503,50 +871,78 @@ CreateMetaPage(Relation index, int dimensions, int lists, ForkNumber forkNum)
  * Create list pages
  */
 static void
-CreateListPages(Relation index, VectorArray centers, int lists,
-				ForkNumber forkNum, ListInfo * *listInfo)
+CreateListPages(Relation index, IvfflatBuildState * buildstate, ForkNumber forkNum)
 {
 	Buffer		buf;
 	Page		page;
 	GenericXLogState *state;
 	Size		listSize;
-	IvfflatList list;
+	VectorArray centers = buildstate->centers;
+	int			lists = buildstate->lists;
+	int			version = buildstate->version;
+	int			includeCount = buildstate->includeCount;
+	char	   *storage;
 
-	listSize = MAXALIGN(IVFFLAT_LIST_SIZE(centers->itemsize));
-	list = palloc0(listSize);
+	if (version == IVFFLAT_VERSION_INCLUDE)
+		listSize = MAXALIGN(IvfflatListHeaderBytes(includeCount) + centers->itemsize);
+	else
+		listSize = MAXALIGN(IVFFLAT_LIST_SIZE(centers->itemsize));
+
+	storage = palloc0(listSize);
 
 	buf = IvfflatNewBuffer(index, forkNum);
-	IvfflatInitRegisterPage(index, &buf, &page, &state);
+	IvfflatInitRegisterPage(index, &buf, &page, &state, version);
 
 	for (int i = 0; i < lists; i++)
 	{
 		OffsetNumber offno;
 
 		/* Zero memory for each list */
-		memset(list, 0, listSize);
+		memset(storage, 0, listSize);
 
-		/* Load list */
-		list->startPage = InvalidBlockNumber;
-		list->insertPage = InvalidBlockNumber;
-		memcpy(&list->center, VectorArrayGet(centers, i), VARSIZE_ANY(VectorArrayGet(centers, i)));
+		if (version == IVFFLAT_VERSION_INCLUDE)
+		{
+			IvfflatListDataV2 *list = (IvfflatListDataV2 *) storage;
+			IvfflatIncludeChain *chains = IvfflatListGetChains(list);
 
-		/* Ensure free space */
+			list->startPage = InvalidBlockNumber;
+			list->insertPage = InvalidBlockNumber;
+			list->dirStartPage = InvalidBlockNumber;
+			list->entry_hwm = 0;
+			list->live_count = 0;
+
+			for (int c = 0; c < includeCount; c++)
+			{
+				chains[c].startPage = InvalidBlockNumber;
+				chains[c].insertPage = InvalidBlockNumber;
+			}
+
+			memcpy(IvfflatListGetCenter(list, includeCount), VectorArrayGet(centers, i),
+				   VARSIZE_ANY(VectorArrayGet(centers, i)));
+		}
+		else
+		{
+			IvfflatList list = (IvfflatList) storage;
+
+			list->startPage = InvalidBlockNumber;
+			list->insertPage = InvalidBlockNumber;
+			memcpy(&list->center, VectorArrayGet(centers, i), VARSIZE_ANY(VectorArrayGet(centers, i)));
+		}
+
 		if (PageGetFreeSpace(page) < listSize)
-			IvfflatAppendPage(index, &buf, &page, &state, forkNum);
+			IvfflatAppendPage(index, &buf, &page, &state, forkNum, version);
 
-		/* Add the item */
-		offno = PageAddItem(page, (Item) list, listSize, InvalidOffsetNumber, false, false);
+		offno = PageAddItem(page, (Item) storage, listSize, InvalidOffsetNumber, false, false);
 		if (offno == InvalidOffsetNumber)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
-		/* Save location info */
-		(*listInfo)[i].blkno = BufferGetBlockNumber(buf);
-		(*listInfo)[i].offno = offno;
+		buildstate->listInfo[i].blkno = BufferGetBlockNumber(buf);
+		buildstate->listInfo[i].offno = offno;
 	}
 
 	IvfflatCommitBuffer(buf, state);
 
-	pfree(list);
+	pfree(storage);
 }
 
 #ifdef IVFFLAT_KMEANS_DEBUG
@@ -1040,8 +1436,8 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	ComputeCenters(buildstate);
 
 	/* Create pages */
-	CreateMetaPage(index, buildstate->dimensions, buildstate->lists, forkNum);
-	CreateListPages(index, buildstate->centers, buildstate->lists, forkNum, &buildstate->listInfo);
+	CreateMetaPage(index, buildstate, forkNum);
+	CreateListPages(index, buildstate, forkNum);
 	CreateEntryPages(buildstate, forkNum);
 
 	/* Write WAL for initialization fork since GenericXLog functions do not */

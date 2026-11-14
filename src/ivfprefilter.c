@@ -14,7 +14,7 @@
  * GUC disabled, EvalPlanQual) is simply "run the child unmodified", which is
  * exactly the plan the planner builds today.
  *
- * See docs/filtered-ann-ivf-prefilter-customscan-spec.md for the full design.
+ * See docs/filtered-ivf.md for the full design.
  */
 #include "postgres.h"
 
@@ -35,11 +35,13 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
+#include "optimizer/restrictinfo.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
@@ -290,6 +292,10 @@ MatchClauseToBtreeColumn(IndexOptInfo *btidx, int col, RestrictInfo *rinfo,
 	if (rinfo->pseudoconstant)
 		return false;
 
+	/* Boolean OR/AND/NOT trees cannot become single-scan B-tree keys */
+	if (IsA(clause, BoolExpr))
+		return false;
+
 	*commute = false;
 
 	if (IsA(clause, OpExpr))
@@ -326,7 +332,9 @@ MatchClauseToBtreeColumn(IndexOptInfo *btidx, int col, RestrictInfo *rinfo,
 		 * The comparison side must be pseudoconstant relative to this rel:
 		 * Consts, Params, and stable expressions over them are all fine
 		 */
-		if (contain_var_clause(other) || contain_volatile_functions(other))
+		if (contain_var_clause(other) ||
+			contain_volatile_functions(other) ||
+			contain_subplans(other))
 			return false;
 
 		if (!op_in_opfamily(opno, opfamily))
@@ -350,7 +358,9 @@ MatchClauseToBtreeColumn(IndexOptInfo *btidx, int col, RestrictInfo *rinfo,
 		if (!match_index_to_operand(leftop, col, btidx))
 			return false;
 
-		if (contain_var_clause(arraynode) || contain_volatile_functions(arraynode))
+		if (contain_var_clause(arraynode) ||
+			contain_volatile_functions(arraynode) ||
+			contain_subplans(arraynode))
 			return false;
 
 		if (!op_in_opfamily(saop->opno, opfamily))
@@ -404,6 +414,10 @@ MatchBtreeIndex(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *btidx)
 	foreach(lc, rel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		/* The B-tree scan runs before row-level security quals */
+		if (!restriction_is_securely_promotable(rinfo, rel))
+			continue;
 
 		/* Take the first column each clause matches */
 		for (int col = 0; col < btidx->nkeycolumns; col++)

@@ -485,6 +485,40 @@ Specify the memory budget for the prefilter TID set in kB (`-1` uses `work_mem` 
 SET ivfflat.prefilter_mem = 256;
 ```
 
+#### IVFFlat included columns
+
+An IVFFlat index can store scalar columns with `INCLUDE`. For a predicate on those columns, the scan reads the included values and skips the distance computation for entries that fail. This does not need a separate B-tree. The planner builds an `IvfIncludeScan`. The index plan keeps the original `Filter` for correctness.
+
+```sql
+CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops)
+    INCLUDE (category_id, price) WITH (lists = 100);
+
+SET ivfflat.iterative_scan = relaxed_order;
+SET ivfflat.max_probes = 100;
+
+SELECT * FROM items
+WHERE category_id = 123 AND price < 10
+ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
+```
+
+The vector is the only key column. Included columns must be fixed-length, `varchar(n)`, or `char(n)`, with `n` at most 512. `text` is not supported.
+
+A selective filter still needs more probes for recall. The included columns make those extra probes cheaper, because entries that fail the predicate skip the distance computation. `ivfflat.probes = 1` is still a poor choice for a very selective filter.
+
+If a B-tree already exists on the filter column, the planner may choose [pre-filtering](#ivfflat-pre-filtering) instead. The two plans are independent. `ivfflat.prefilter` controls the B-tree plan, and `ivfflat.include_filter` controls the included-column plan.
+
+Enable or disable included-column filtering (`on` by default)
+
+```sql
+SET ivfflat.include_filter = off;
+```
+
+Specify the memory budget for the included-column passing set in kB (`-1` uses `work_mem` by default)
+
+```sql
+SET ivfflat.include_mem = 256;
+```
+
 If filtering by only a few distinct values, consider [partial indexing](https://www.postgresql.org/docs/current/indexes-partial.html).
 
 ```sql
